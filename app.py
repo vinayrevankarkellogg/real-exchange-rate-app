@@ -12,30 +12,57 @@ COUNTRIES = {
     "Japan": "JPN", "Canada": "CAN", "Switzerland": "CHE", "Australia": "AUS"
 }
 
-def fetch_imf_data(series_key):
-    """Fetches time series data from IMF SDMX 3.0 API."""
-    # Note: Base SDMX 3.0 query structure. 
-    url = f"https://api.imf.org/external/sdmx/3.0/data/IMF,IFS,1.0/{series_key}"
+@st.cache_data(ttl=3600, show_spinner=False)
+def _request_imf_series(series_key):
+    """Requests and parses time series data from the IMF SDMX 3.0 API."""
+    dataflow = "ER" if "XDC_USD" in series_key else "CPI"
     headers = {"Accept": "application/vnd.sdmx.data+json;version=2.0.0"}
-    
-    try:
-        response = requests.get(url, headers=headers)
+
+    keys_to_try = [series_key]
+    if dataflow == "CPI" and ".CPI." in series_key:
+        keys_to_try.append(series_key.replace(".CPI.", ".HICP."))
+
+    for key in keys_to_try:
+        url = f"https://api.imf.org/external/sdmx/3.0/data/dataflow/IMF.STA/{dataflow}/+/{key}"
+        response = requests.get(url, headers=headers, timeout=30)
         response.raise_for_status()
         data = response.json()
-        
-        # Parse standard SDMX-JSON structure (simplified for this context)
-        # Note: Actual parsing logic may require traversing the exact SDMX nested dictionary
-        # returning a dummy DataFrame structure based on typical API return formats
-        obs = data['data']['dataSets'][0]['series']
-        
+
+        datasets = data.get("data", {}).get("dataSets", [])
+        if not datasets or "series" not in datasets[0] or not datasets[0]["series"]:
+            continue
+
+        series_dict = datasets[0]["series"]
+        first_series = next(iter(series_dict.values()))
+        obs = first_series.get("observations", {})
+        if not obs:
+            continue
+
+        structures = data.get("data", {}).get("structures", [])
+        obs_dims = structures[0]["dimensions"]["observation"][0]["values"]
+
         dates = []
         values = []
-        
-        # Mapping observations to dates 
-        # (Placeholder for exact nested SDMX traversal logic based on IMF's specific schema)
-        df = pd.DataFrame({"Date": pd.date_range(start="1976-01-01", periods=100, freq="M"), "Value": 100.0})
+        for idx_str, val_list in obs.items():
+            if not val_list or val_list[0] is None:
+                continue
+            period_info = obs_dims[int(idx_str)]
+            period_str = period_info.get("value") or period_info.get("id")
+            dates.append(pd.to_datetime(period_str, format="%Y-M%m"))
+            values.append(float(val_list[0]))
+
+        df = pd.DataFrame({"Date": dates, "Value": values})
         df.set_index("Date", inplace=True)
+        df.sort_index(inplace=True)
         return df
+
+    return pd.DataFrame()
+
+
+def fetch_imf_data(series_key):
+    """Fetches time series data from IMF SDMX 3.0 API."""
+    try:
+        return _request_imf_series(series_key)
     except Exception as e:
         st.error(f"Error fetching {series_key}: {e}")
         return pd.DataFrame()
@@ -54,12 +81,31 @@ c2_code = COUNTRIES[c2_name]
 
 # Date selection
 st.sidebar.header("Sample Period")
-start_date = st.sidebar.date_input("Start Date", pd.to_datetime("1976-01-01"))
-end_date = st.sidebar.date_input("End Date", pd.to_datetime("today"))
+min_date = pd.to_datetime("1976-01-01").date()
+max_date = pd.to_datetime("today").date()
+start_date = st.sidebar.date_input(
+    "Start Date",
+    value=min_date,
+    min_value=min_date,
+    max_value=max_date,
+)
+end_date = st.sidebar.date_input(
+    "End Date",
+    value=max_date,
+    min_value=min_date,
+    max_value=max_date,
+)
 
 chart_type = st.sidebar.radio("Display Data", ["Real", "Nominal", "Both"])
 
 if st.button("Fetch and Calculate Data"):
+    st.session_state["calculated"] = True
+
+if st.session_state.get("calculated", False):
+    if start_date > end_date:
+        st.error("Start Date must be on or before End Date.")
+        st.stop()
+
     with st.spinner('Fetching IMF Data...'):
         # Construct keys
         cpi_key1 = f"{c1_code}.CPI._T.IX.M"
@@ -80,9 +126,13 @@ if st.button("Fetch and Calculate Data"):
         # Combine into a single DataFrame
         df = pd.concat([df_cpi1, df_cpi2, df_fx1, df_fx2], axis=1).dropna()
         df.columns = ['P1', 'P2', 'FX1_USD', 'FX2_USD']
+        df.sort_index(inplace=True)
         
         # Filter dates
-        df = df.loc[start_date:end_date].copy()
+        df = df.loc[pd.Timestamp(start_date):pd.Timestamp(end_date)].copy()
+        if df.empty:
+            st.error("No overlapping data available for the selected date range.")
+            st.stop()
         
         # S(t): Units of Country 2 currency per one unit of Country 1 currency
         # Since FX is Local per USD: Country 1 to USD = 1/FX1. Then USD to Country 2 = FX2.
