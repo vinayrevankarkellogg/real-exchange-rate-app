@@ -1,0 +1,7 @@
+[theme]
+# Material Design 3 Light Theme Palette
+primaryColor = "#6750A4"
+backgroundColor = "#FEF7FF"
+secondaryBackgroundColor = "#EADDFF"
+textColor = "#1D1B20"
+font = "sans serif"
